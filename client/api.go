@@ -1,43 +1,23 @@
-package qbt
+package client
 
 import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
-	"os"
-	"path"
-
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
-
-	wrapper "github.com/pkg/errors"
-
-	"golang.org/x/net/publicsuffix"
+	"time"
 )
-
-// ErrBadPriority means the priority is not allowd by qbittorrent
-var ErrBadPriority = errors.New("priority not available")
 
 // ErrBadResponse means that qbittorrent sent back an unexpected response
 var ErrBadResponse = errors.New("received bad response")
-
-// delimit puts list into a combined (single element) map with all items connected separated by the delimiter
-// this is how the WEBUI API recognizes multiple items
-func delimit(items []string, delimiter string) (delimited string) {
-	for i, v := range items {
-		if i > 0 {
-			delimited += delimiter + v
-		} else {
-			delimited = v
-		}
-	}
-	return delimited
-}
 
 // Client creates a connection to qbittorrent and performs requests
 type Client struct {
@@ -47,8 +27,9 @@ type Client struct {
 	Jar           http.CookieJar
 }
 
-// NewClient creates a new client connection to qbittorrent
-func NewClient(url string) *Client {
+// NewClient creates a new client connection to qbittorrent.
+// If requestTimeout sett to 0, defaults to 1 minute
+func NewClient(url string, requestTimeout time.Duration) *Client {
 	client := &Client{}
 
 	// ensure url ends with "/"
@@ -58,26 +39,31 @@ func NewClient(url string) *Client {
 
 	client.URL = url
 
+	if requestTimeout == 0 {
+		requestTimeout = time.Minute
+	}
+
 	// create cookie jar
-	client.Jar, _ = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	client.Jar, _ = cookiejar.New(nil)
 	client.http = &http.Client{
-		Jar: client.Jar,
+		Jar:     client.Jar,
+		Timeout: requestTimeout,
 	}
 	return client
 }
 
 // get will perform a GET request with no parameters
 func (client *Client) get(endpoint string, opts map[string]string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", client.URL+endpoint, nil)
+	req, err := http.NewRequest(http.MethodGet, client.URL+endpoint, nil)
 	if err != nil {
-		return nil, wrapper.Wrap(err, "failed to build request")
+		return nil, fmt.Errorf("failed to build request: %w", err)
 	}
 
 	//add user-agent header to allow qbittorrent to identify us
 	req.Header.Set("User-Agent", "go-qbittorrent v0.1")
 
 	//add optional parameters that the user wants
-	if opts != nil {
+	if len(opts) > 0 {
 		query := req.URL.Query()
 		for k, v := range opts {
 			query.Add(k, v)
@@ -87,10 +73,38 @@ func (client *Client) get(endpoint string, opts map[string]string) (*http.Respon
 
 	resp, err := client.http.Do(req)
 	if err != nil {
-		return nil, wrapper.Wrap(err, "failed to perform request")
+		return nil, fmt.Errorf("failed to perform %s request: %w", endpoint, err)
 	}
 
 	return resp, nil
+}
+
+func (client *Client) getStatus(endpoint string, opts map[string]string) (err error) {
+	var resp *http.Response
+	resp, err = client.get(endpoint, opts)
+	if err != nil {
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		err = ErrBadResponse
+	}
+	_ = resp.Body.Close()
+	return
+}
+
+func (client *Client) getJSON(endpoint string, opts map[string]string, readVal any) (err error) {
+	var resp *http.Response
+	resp, err = client.get(endpoint, opts)
+	if err != nil {
+		return
+	}
+	if resp.StatusCode == http.StatusOK {
+		err = json.NewDecoder(resp.Body).Decode(readVal)
+	} else {
+		err = ErrBadResponse
+	}
+	_ = resp.Body.Close()
+	return
 }
 
 // post will perform a POST request with no content-type specified
@@ -101,9 +115,9 @@ func (client *Client) post(endpoint string, opts map[string]string) (*http.Respo
 		form.Add(k, v)
 	}
 
-	req, err := http.NewRequest("POST", client.URL+endpoint, strings.NewReader(form.Encode()))
+	req, err := http.NewRequest(http.MethodPost, client.URL+endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return nil, wrapper.Wrap(err, "failed to build request")
+		return nil, fmt.Errorf("failed to build request: %w", err)
 	}
 
 	// add the content-type so qbittorrent knows what to expect
@@ -113,17 +127,47 @@ func (client *Client) post(endpoint string, opts map[string]string) (*http.Respo
 
 	resp, err := client.http.Do(req)
 	if err != nil {
-		return nil, wrapper.Wrap(err, "failed to perform request")
+		return nil, fmt.Errorf("failed to perform request: %w", err)
 	}
 
 	return resp, nil
 }
 
+func (client *Client) postStatus(endpoint string, opts map[string]string) (err error) {
+	var resp *http.Response
+	resp, err = client.post(endpoint, opts)
+	if err != nil {
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		err = ErrBadResponse
+	}
+	_ = resp.Body.Close()
+	return
+}
+
+func (client *Client) postJSON(endpoint string, opts map[string]string, readVal any) (err error) {
+	var resp *http.Response
+	resp, err = client.post(endpoint, opts)
+	if err != nil {
+		return
+	}
+	if resp.StatusCode == http.StatusOK {
+		err = json.NewDecoder(resp.Body).Decode(readVal)
+	} else {
+		err = ErrBadResponse
+	}
+	_ = resp.Body.Close()
+	return
+}
+
 // postMultipart will perform a multiple part POST request
-func (client *Client) postMultipart(endpoint string, buffer bytes.Buffer, contentType string) (resp *http.Response, err error) {
+func (client *Client) postMultipart(endpoint string, buffer bytes.Buffer, contentType string) (
+	resp *http.Response, err error,
+) {
 	req, err := http.NewRequest("POST", client.URL+endpoint, &buffer)
 	if err != nil {
-		return nil, wrapper.Wrap(err, "error creating request")
+		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
 	// add the content-type so qbittorrent knows what to expect
@@ -133,7 +177,7 @@ func (client *Client) postMultipart(endpoint string, buffer bytes.Buffer, conten
 
 	resp, err = client.http.Do(req)
 	if err != nil {
-		return nil, wrapper.Wrap(err, "failed to perform request")
+		return nil, fmt.Errorf("failed to perform request: %w", err)
 	}
 
 	return resp, nil
@@ -142,11 +186,11 @@ func (client *Client) postMultipart(endpoint string, buffer bytes.Buffer, conten
 // writeOptions will write a map to the buffer through multipart.NewWriter
 func writeOptions(writer *multipart.Writer, opts map[string]string) (err error) {
 	for key, val := range opts {
-		if err := writer.WriteField(key, val); err != nil {
-			return err
+		if err = writer.WriteField(key, val); err != nil {
+			return
 		}
 	}
-	return nil
+	return
 }
 
 // postMultipartData will perform a multiple part POST request without a file
@@ -157,12 +201,12 @@ func (client *Client) postMultipartData(endpoint string, opts map[string]string)
 	// write the options to the buffer
 	// will contain the link string
 	if err := writeOptions(writer, opts); err != nil {
-		return nil, wrapper.Wrap(err, "failed to write options")
+		return nil, fmt.Errorf("failed to write options: %w", err)
 	}
 
 	// close the writer before doing request to get closing line on multipart request
 	if err := writer.Close(); err != nil {
-		return nil, wrapper.Wrap(err, "failed to close writer")
+		return nil, fmt.Errorf("failed to close writer: %w", err)
 	}
 
 	resp, err := client.postMultipart(endpoint, buffer, writer.FormDataContentType())
@@ -174,36 +218,31 @@ func (client *Client) postMultipartData(endpoint string, opts map[string]string)
 }
 
 // postMultipartFile will perform a multiple part POST request with a file
-func (client *Client) postMultipartFile(endpoint string, fileName string, opts map[string]string) (*http.Response, error) {
+func (client *Client) postMultipartReader(endpoint string, in io.Reader, opts map[string]string) (
+	*http.Response, error,
+) {
 	var buffer bytes.Buffer
 	writer := multipart.NewWriter(&buffer)
 
-	// open the file for reading
-	file, err := os.Open(fileName)
-	if err != nil {
-		return nil, wrapper.Wrap(err, "error opening file")
-	}
-	// defer the closing of the file until the end of function
-	// so we can still copy its contents
-	defer file.Close()
-
 	// write the options to the buffer
-	writeOptions(writer, opts)
+	if err := writeOptions(writer, opts); err != nil {
+		return nil, err
+	}
 
 	// create form for writing the file to and give it the filename
-	formWriter, err := writer.CreateFormFile("torrents", path.Base(fileName))
+	formWriter, err := writer.CreateFormFile("torrents", "file.torrent")
 	if err != nil {
-		return nil, wrapper.Wrap(err, "error adding file")
+		return nil, err
 	}
 
 	// copy the file contents into the form
-	if _, err = io.Copy(formWriter, file); err != nil {
-		return nil, wrapper.Wrap(err, "error copying file")
+	if _, err := io.Copy(formWriter, in); err != nil {
+		return nil, err
 	}
 
 	// close the writer before doing request to get closing line on multipart request
 	if err := writer.Close(); err != nil {
-		return nil, wrapper.Wrap(err, "failed to close writer")
+		return nil, err
 	}
 
 	resp, err := client.postMultipart(endpoint, buffer, writer.FormDataContentType())
@@ -228,11 +267,15 @@ func (client *Client) Login(opts LoginOptions) (err error) {
 		params["password"] = opts.Password
 	}
 
-	resp, err := client.post("api/v2/auth/login", params)
+	var resp *http.Response
+	resp, err = client.post("api/v2/auth/login", params)
 	if err != nil {
-		return err
-	} else if resp.StatusCode == 403 {
-		return wrapper.Errorf("User's IP is banned for too many failed login attempts")
+		return
+	} else {
+		defer resp.Body.Close()
+		if resp.StatusCode == 403 {
+			return fmt.Errorf("user's IP is banned for too many failed login attempts")
+		}
 	}
 
 	// add the cookie to cookie jar to authenticate later requests
@@ -245,121 +288,106 @@ func (client *Client) Login(opts LoginOptions) (err error) {
 			Jar: client.Jar,
 		}
 	} else {
-		return wrapper.Errorf("Could not get cookie")
+		return fmt.Errorf("could not get cookie")
 	}
 
 	// change authentication status so we know were authenticated in later requests
 	client.Authenticated = true
 
-	return nil
+	return
 }
 
 // Logout logs you out of the qbittorrent client
 // returns the current authentication status
-func (client *Client) Logout() (err error) {
-	resp, err := client.post("api/v2/auth/logout", nil)
-	if err != nil {
-		return err
+func (client *Client) Logout() error {
+	err := client.getStatus("api/v2/auth/logout", nil)
+	if err == nil {
+		client.Authenticated = false
 	}
-
-	// change authentication status so we know were not authenticated in later requests
-	client.Authenticated = (*resp).StatusCode == 200
-	if (*resp).StatusCode != 200 {
-		return wrapper.Errorf("An unknown error occurred causing a status code of: %d", (*resp).StatusCode)
-	}
-	return
+	return err
 }
 
 // ApplicationVersion of the qbittorrent client
 func (client *Client) ApplicationVersion() (version string, err error) {
-	resp, err := client.post("api/v2/app/version", nil)
+	var resp *http.Response
+	resp, err = client.post("api/v2/app/version", nil)
 	if err != nil {
 		return version, err
 	}
+	defer resp.Body.Close()
 	buf := new(strings.Builder)
-	io.Copy(buf, resp.Body)
-	version = buf.String()
+	if _, err = io.Copy(buf, resp.Body); err == nil {
+		version = buf.String()
+	}
 	return
 }
 
 // WebAPIVersion of the qbittorrent client
 func (client *Client) WebAPIVersion() (version string, err error) {
-	resp, err := client.post("api/v2/app/webapiVersion", nil)
+	var resp *http.Response
+	resp, err = client.post("api/v2/app/webapiVersion", nil)
 	if err != nil {
 		return version, err
 	}
+	defer resp.Body.Close()
 	buf := new(strings.Builder)
-	io.Copy(buf, resp.Body)
-	version = buf.String()
+	if _, err = io.Copy(buf, resp.Body); err == nil {
+		version = buf.String()
+	}
 	return
 }
 
 // BuildInfo of the qbittorrent client
 func (client *Client) BuildInfo() (buildInfo BuildInfo, err error) {
-	resp, err := client.get("api/v2/app/buildInfo", nil)
-	if err != nil {
-		return buildInfo, err
-	}
-	json.NewDecoder(resp.Body).Decode(&buildInfo)
-	return buildInfo, err
+	err = client.getJSON("api/v2/app/buildInfo", nil, &buildInfo)
+	return
 }
 
 // Preferences of the qbittorrent client
 func (client *Client) Preferences() (prefs Preferences, err error) {
-	resp, err := client.get("api/v2/app/preferences", nil)
-	if err != nil {
-		return prefs, err
-	}
-	json.NewDecoder(resp.Body).Decode(&prefs)
-	return prefs, err
+	err = client.getJSON("api/v2/app/preferences", nil, &prefs)
+	return
 }
 
 // SetPreferences of the qbittorrent client
-func (client *Client) SetPreferences() (prefsSet bool, err error) {
-	resp, err := client.post("api/v2/app/setPreferences", nil)
-	return (resp.Status == "200 OK"), err
+func (client *Client) SetPreferences() error {
+	// fixme: no arguments
+	return client.postStatus("api/v2/app/setPreferences", nil)
 }
 
 // DefaultSavePath of the qbittorrent client
 func (client *Client) DefaultSavePath() (path string, err error) {
-	resp, err := client.get("api/v2/app/defaultSavePath", nil)
+	var resp *http.Response
+	resp, err = client.get("api/v2/app/defaultSavePath", nil)
 	if err != nil {
-		return path, err
+		return
 	}
 	buf := new(strings.Builder)
-	io.Copy(buf, resp.Body)
-	path = buf.String()
+	if _, err = io.Copy(buf, resp.Body); err == nil {
+		path = buf.String()
+	}
+	_ = resp.Body.Close()
 	return
 }
 
 // Shutdown shuts down the qbittorrent client
-func (client *Client) Shutdown() (shuttingDown bool, err error) {
-	resp, err := client.get("api/v2/app/shutdown", nil)
-
-	// return true if successful
-	return (resp.Status == "200 OK"), err
+func (client *Client) Shutdown() (err error) {
+	err = client.getStatus("api/v2/app/shutdown", nil)
+	return
 }
 
 // Log Endpoints
 
 // Logs of the qbittorrent client
 func (client *Client) Logs(filters map[string]string) (logs []Log, err error) {
-	resp, err := client.get("api/v2/log/main", filters)
-	if err != nil {
-		return logs, err
-	}
-	json.NewDecoder(resp.Body).Decode(&logs)
-	return logs, err
+	err = client.getJSON("api/v2/log/main", filters, &logs)
+	return
 }
 
 // PeerLogs of the qbittorrent client
 func (client *Client) PeerLogs(filters map[string]string) (logs []PeerLog, err error) {
-	resp, err := client.get("api/v2/log/peers", filters)
-	if err != nil {
-		return logs, err
-	}
-	json.NewDecoder(resp.Body).Decode(&logs)
-	return logs, err
+	err = client.getJSON("api/v2/log/peers", filters, &logs)
+	return
 }
 
 // TODO: Sync Endpoints
@@ -367,74 +395,44 @@ func (client *Client) PeerLogs(filters map[string]string) (logs []PeerLog, err e
 // TODO: Transfer Endpoints
 
 // Info returns info you usually see in qBt status bar.
-func (client *Client) Info(opts InfoOptions) (info Info, err error) {
-	resp, err := client.get("api/v2/transfer/info", nil)
-	if err != nil {
-		return info, err
-	}
-	json.NewDecoder(resp.Body).Decode(&info)
-	return info, err
+func (client *Client) Info() (info Info, err error) {
+	err = client.getJSON("api/v2/transfer/info", nil, &info)
+	return
 }
 
 // AltSpeedLimitsEnabled returns info you usually see in qBt status bar.
 func (client *Client) AltSpeedLimitsEnabled() (mode bool, err error) {
-	resp, err := client.get("api/v2/transfer/speedLimitsMode", nil)
-	if err != nil {
-		return mode, err
-	}
 	var decoded int
-	json.NewDecoder(resp.Body).Decode(&decoded)
+	err = client.getJSON("api/v2/transfer/speedLimitsMode", nil, &decoded)
 	mode = decoded == 1
-	return mode, err
+	return
 }
 
 // ToggleAltSpeedLimits returns info you usually see in qBt status bar.
-func (client *Client) ToggleAltSpeedLimits() (toggled bool, err error) {
-	resp, err := client.get("api/v2/transfer/toggleSpeedLimitsMode", nil)
-	if err != nil {
-		return toggled, err
-	}
-	return (resp.Status == "200 OK"), err
+func (client *Client) ToggleAltSpeedLimits() error {
+	return client.getStatus("api/v2/transfer/toggleSpeedLimitsMode", nil)
 }
 
 // DlLimit returns info you usually see in qBt status bar.
 func (client *Client) DlLimit() (dlLimit int, err error) {
-	resp, err := client.get("api/v2/transfer/downloadLimit", nil)
-	if err != nil {
-		return dlLimit, err
-	}
-	json.NewDecoder(resp.Body).Decode(&dlLimit)
-	return dlLimit, err
+	err = client.getJSON("api/v2/transfer/downloadLimit", nil, &dlLimit)
+	return
 }
 
 // SetDlLimit returns info you usually see in qBt status bar.
-func (client *Client) SetDlLimit(limit int) (set bool, err error) {
-	params := map[string]string{"limit": strconv.Itoa(limit)}
-	resp, err := client.get("api/v2/transfer/setDownloadLimit", params)
-	if err != nil {
-		return set, err
-	}
-	return (resp.Status == "200 OK"), err
+func (client *Client) SetDlLimit(limit int) error {
+	return client.getStatus("api/v2/transfer/setDownloadLimit", map[string]string{"limit": strconv.Itoa(limit)})
 }
 
 // UlLimit returns info you usually see in qBt status bar.
 func (client *Client) UlLimit() (ulLimit int, err error) {
-	resp, err := client.get("api/v2/transfer/uploadLimit", nil)
-	if err != nil {
-		return ulLimit, err
-	}
-	json.NewDecoder(resp.Body).Decode(&ulLimit)
-	return ulLimit, err
+	err = client.getJSON("api/v2/transfer/uploadLimit", nil, &ulLimit)
+	return
 }
 
 // SetUlLimit returns info you usually see in qBt status bar.
-func (client *Client) SetUlLimit(limit int) (set bool, err error) {
-	params := map[string]string{"limit": strconv.Itoa(limit)}
-	resp, err := client.get("api/v2/transfer/setUploadLimit", params)
-	if err != nil {
-		return set, err
-	}
-	return (resp.Status == "200 OK"), err
+func (client *Client) SetUlLimit(limit int) error {
+	return client.getStatus("api/v2/transfer/setUploadLimit", map[string]string{"limit": strconv.Itoa(limit)})
 }
 
 // Torrents returns a list of all torrents in qbittorrent matching your filter
@@ -459,151 +457,87 @@ func (client *Client) Torrents(opts TorrentsOptions) (torrentList []TorrentInfo,
 		params["limit"] = strconv.Itoa(*opts.Limit)
 	}
 	if opts.Hashes != nil {
-		params["hashes"] = delimit(opts.Hashes, "%0A")
+		params["hashes"] = strings.Join(opts.Hashes, "%0A")
 	}
-	resp, err := client.get("api/v2/torrents/info", params)
-	if err != nil {
-		return torrentList, err
-	}
-	json.NewDecoder(resp.Body).Decode(&torrentList)
-	return torrentList, nil
+	err = client.getJSON("api/v2/torrents/info", params, &torrentList)
+	return
 }
 
 // Torrent returns a specific torrent matching the hash
 func (client *Client) Torrent(hash string) (torrent Torrent, err error) {
-	var opts = map[string]string{"hash": strings.ToLower(hash)}
-	resp, err := client.get("api/v2/torrents/properties", opts)
-	if err != nil {
-		return torrent, err
-	}
-	json.NewDecoder(resp.Body).Decode(&torrent)
-	return torrent, nil
+	err = client.getJSON("api/v2/torrents/properties", map[string]string{"hash": strings.ToLower(hash)}, &torrent)
+	return
 }
 
 // TorrentTrackers returns all trackers for a specific torrent matching the hash
 func (client *Client) TorrentTrackers(hash string) (trackers []Tracker, err error) {
-	var opts = map[string]string{"hash": strings.ToLower(hash)}
-	resp, err := client.get("api/v2/torrents/trackers", opts)
-	if err != nil {
-		return trackers, err
-	}
-	json.NewDecoder(resp.Body).Decode(&trackers)
-	return trackers, nil
+	err = client.getJSON("api/v2/torrents/trackers", map[string]string{"hash": strings.ToLower(hash)}, &trackers)
+	return
 }
 
 // TorrentWebSeeds returns seeders for a specific torrent matching the hash
 func (client *Client) TorrentWebSeeds(hash string) (webSeeds []WebSeed, err error) {
-	var opts = map[string]string{"hash": strings.ToLower(hash)}
-	resp, err := client.get("api/v2/torrents/webseeds", opts)
-	if err != nil {
-		return webSeeds, err
-	}
-	json.NewDecoder(resp.Body).Decode(&webSeeds)
-	return webSeeds, nil
+	err = client.getJSON("api/v2/torrents/webseeds", map[string]string{"hash": strings.ToLower(hash)}, &webSeeds)
+	return
 }
 
 // TorrentFiles from given hash
 func (client *Client) TorrentFiles(hash string) (files []TorrentFile, err error) {
-	var opts = map[string]string{"hash": strings.ToLower(hash)}
-	resp, err := client.get("api/v2/torrents/files", opts)
-	if err != nil {
-		return files, err
-	}
-	json.NewDecoder(resp.Body).Decode(&files)
-	return files, nil
+	err = client.getJSON("api/v2/torrents/files", map[string]string{"hash": strings.ToLower(hash)}, &files)
+	return
 }
 
 // TorrentPieceStates for all pieces of torrent
 func (client *Client) TorrentPieceStates(hash string) (states []int, err error) {
-	var opts = map[string]string{"hash": strings.ToLower(hash)}
-	resp, err := client.get("api/v2/torrents/pieceStates", opts)
-	if err != nil {
-		return states, err
-	}
-	json.NewDecoder(resp.Body).Decode(&states)
-	return states, nil
+	err = client.getJSON("api/v2/torrents/pieceStates", map[string]string{"hash": strings.ToLower(hash)}, &states)
+	return
 }
 
 // TorrentPieceHashes for all pieces of torrent
 func (client *Client) TorrentPieceHashes(hash string) (hashes []string, err error) {
-	var opts = map[string]string{"hash": strings.ToLower(hash)}
-	resp, err := client.get("api/v2/torrents/pieceHashes", opts)
-	if err != nil {
-		return hashes, err
-	}
-	json.NewDecoder(resp.Body).Decode(&hashes)
-	return hashes, nil
+	err = client.getJSON("api/v2/torrents/pieceHashes", map[string]string{"hash": strings.ToLower(hash)}, &hashes)
+	return
 }
 
 // Pause torrents
 func (client *Client) Pause(hashes []string) error {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
-	_, err := client.get("api/v2/torrents/pause", opts)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return client.getStatus("api/v2/torrents/pause", map[string]string{"hashes": strings.Join(hashes, "|")})
 }
 
 // Resume torrents
-func (client *Client) Resume(hashes []string) (bool, error) {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
-	resp, err := client.get("api/v2/torrents/start", opts)
-	if err != nil {
-		return false, err
-	}
-
-	return resp.StatusCode == 200, nil
+func (client *Client) Resume(hashes []string) error {
+	return client.getStatus("api/v2/torrents/start", map[string]string{"hashes": strings.Join(hashes, "|")})
 }
 
 // Delete torrents and optionally delete their files
-func (client *Client) Delete(hashes []string, deleteFiles bool) (bool, error) {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
-	opts["deleteFiles"] = strconv.FormatBool(deleteFiles)
-	resp, err := client.post("api/v2/torrents/delete", opts)
-	if err != nil {
-		return false, err
-	}
-
-	return resp.StatusCode == 200, nil
+func (client *Client) Delete(hashes []string, deleteFiles bool) error {
+	return client.getStatus("api/v2/torrents/delete",
+		map[string]string{"hashes": strings.Join(hashes, "|"), "deleteFiles": strconv.FormatBool(deleteFiles)})
 }
 
 // Recheck torrents
-func (client *Client) Recheck(hashes []string) (bool, error) {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
-	resp, err := client.post("api/v2/torrents/recheck", opts)
-	if err != nil {
-		return false, err
-	}
-
-	return resp.StatusCode == 200, nil
+func (client *Client) Recheck(hashes []string) error {
+	return client.getStatus("api/v2/torrents/recheck", map[string]string{"hashes": strings.Join(hashes, "|")})
 }
 
 // Reannounce torrents
-func (client *Client) Reannounce(hashes []string) (bool, error) {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
-	resp, err := client.get("api/v2/torrents/reannounce", opts)
-	if err != nil {
-		return false, err
-	}
+func (client *Client) Reannounce(hashes []string) error {
+	return client.getStatus("api/v2/torrents/reannounce", map[string]string{"hashes": strings.Join(hashes, "|")})
 
-	return resp.StatusCode == 200, nil
 }
 
-// DownloadFromLink starts downloading a torrent from a link
+// DownloadLinks starts downloading a torrent from a link
 func (client *Client) DownloadLinks(links []string, opts DownloadOptions) error {
 	params := map[string]string{}
 	if len(links) == 0 {
-		return wrapper.Errorf("At least one url must be present")
+		return fmt.Errorf("at least one url must be present")
 	} else {
-		delimitedURLs := delimit(links, "%0A")
 		// TODO: Why is encoding causing problems now?
-		// encodedURLS := url.QueryEscape(delimitedURLs)
-		params["urls"] = delimitedURLs
+		// encodedURLS := url.QueryEscape(strings.JoinedURLs)
+		params["urls"] = strings.Join(links, "%0A")
 	}
-	if opts.Savepath != nil {
-		params["savepath"] = *opts.Savepath
+	if opts.SavePath != nil {
+		params["savepath"] = *opts.SavePath
 	}
 	if opts.Cookie != nil {
 		params["cookie"] = *opts.Cookie
@@ -639,21 +573,39 @@ func (client *Client) DownloadLinks(links []string, opts DownloadOptions) error 
 	resp, err := client.postMultipartData("api/v2/torrents/add", params)
 	if err != nil {
 		return err
-	} else if resp.StatusCode == 415 {
-		return wrapper.Errorf("Torrent file is not valid")
+	} else {
+		_ = resp.Body.Close()
+		if resp.StatusCode == 415 {
+			return fmt.Errorf("torrent file is not valid")
+		}
 	}
 
 	return nil
 }
 
 // DownloadFromFile starts downloading a torrent from a file
-func (client *Client) DownloadFromFile(torrents string, opts DownloadOptions) error {
-	params := map[string]string{}
-	if torrents == "" {
-		return wrapper.Errorf("At least one file must be present")
+func (client *Client) DownloadFromFile(torrentPath string, opts DownloadOptions) error {
+	if torrentPath == "" {
+		return fmt.Errorf("torrentPath must be present")
 	}
-	if opts.Savepath != nil {
-		params["savepath"] = *opts.Savepath
+	var file *os.File
+	file, err := os.Open(torrentPath)
+	if err != nil {
+		return err
+	}
+	err = client.DownloadFromReader(file, opts)
+	_ = file.Close()
+	return err
+}
+
+// DownloadFromReader starts downloading a torrent from io.Reader
+func (client *Client) DownloadFromReader(torrent io.Reader, opts DownloadOptions) error {
+	params := map[string]string{}
+	if torrent == nil {
+		return fmt.Errorf("reader must be present")
+	}
+	if opts.SavePath != nil {
+		params["savepath"] = *opts.SavePath
 	}
 	if opts.Cookie != nil {
 		params["cookie"] = *opts.Cookie
@@ -688,11 +640,14 @@ func (client *Client) DownloadFromFile(torrents string, opts DownloadOptions) er
 	if opts.FirstLastPiecePriority != nil {
 		params["firstLastPiecePrio"] = strconv.FormatBool(*opts.FirstLastPiecePriority)
 	}
-	resp, err := client.postMultipartFile("api/v2/torrents/add", torrents, params)
+	resp, err := client.postMultipartReader("api/v2/torrents/add", torrent, params)
 	if err != nil {
 		return err
-	} else if resp.StatusCode == 415 {
-		return wrapper.Errorf("Torrent file is not valid")
+	} else {
+		_ = resp.Body.Close()
+		if resp.StatusCode == 415 {
+			return fmt.Errorf("torrent file is not valid")
+		}
 	}
 
 	return nil
@@ -700,17 +655,15 @@ func (client *Client) DownloadFromFile(torrents string, opts DownloadOptions) er
 
 // AddTrackers to a torrent
 func (client *Client) AddTrackers(hash string, trackers []string) error {
-	params := make(map[string]string)
-	params["hash"] = strings.ToLower(hash)
-	delimitedTrackers := delimit(trackers, "%0A")
-	encodedTrackers := url.QueryEscape(delimitedTrackers)
-	params["urls"] = encodedTrackers
-
-	resp, err := client.post("api/v2/torrents/addTrackers", params)
+	resp, err := client.post("api/v2/torrents/addTrackers",
+		map[string]string{"hash": strings.ToLower(hash), "urls": url.QueryEscape(strings.Join(trackers, "%0A"))})
 	if err != nil {
 		return err
-	} else if resp != nil && (*resp).StatusCode == 404 {
-		return wrapper.Errorf("Torrent hash not found")
+	} else {
+		_ = resp.Body.Close()
+		if resp.StatusCode == 404 {
+			return fmt.Errorf("torrent hash not found")
+		}
 	}
 	return nil
 }
@@ -726,13 +679,14 @@ func (client *Client) EditTracker(hash string, origURL string, newURL string) er
 	if err != nil {
 		return err
 	}
-	switch sc := (*resp).StatusCode; sc {
+	_ = resp.Body.Close()
+	switch resp.StatusCode {
 	case 400:
-		return wrapper.Errorf("newUrl is not a valid url")
+		return fmt.Errorf("newUrl is not a valid url")
 	case 404:
-		return wrapper.Errorf("Torrent hash was not found")
+		return fmt.Errorf("torrent hash was not found")
 	case 409:
-		return wrapper.Errorf("newUrl already exists for this torrent or origUrl was not found")
+		return fmt.Errorf("newUrl already exists for this torrent or origUrl was not found")
 	default:
 		return nil
 	}
@@ -742,107 +696,112 @@ func (client *Client) EditTracker(hash string, origURL string, newURL string) er
 func (client *Client) RemoveTrackers(hash string, trackers []string) error {
 	params := map[string]string{
 		"hash": hash,
-		"urls": delimit(trackers, "|"),
+		"urls": strings.Join(trackers, "|"),
 	}
 	resp, err := client.get("api/v2/torrents/removeTrackers", params)
 	if err != nil {
 		return err
 	}
 
-	switch sc := (*resp).StatusCode; sc {
+	_ = resp.Body.Close()
+	switch sc := resp.StatusCode; sc {
 	case 200:
 		return nil
 	case 404:
-		return wrapper.Errorf("Torrent hash was not found")
+		return fmt.Errorf("torrent hash was not found")
 	case 409:
-		return wrapper.Errorf("All URLs were not found")
+		return fmt.Errorf("all URLs were not found")
 	default:
-		return wrapper.Errorf("An unknown error occurred causing a status code of: %v", sc)
+		return fmt.Errorf("an unknown error occurred causing a status code of: %v", sc)
 	}
 }
 
 // IncreasePriority of torrents
 func (client *Client) IncreasePriority(hashes []string) error {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
+	opts := map[string]string{"hashes": strings.Join(hashes, "|")}
 	resp, err := client.post("api/v2/torrents/increasePrio", opts)
 	if err != nil {
 		return err
 	}
 
-	switch sc := (*resp).StatusCode; sc {
+	_ = resp.Body.Close()
+	switch sc := resp.StatusCode; sc {
 	case 200:
 		return nil
 	case 409:
-		return wrapper.Errorf("Torrent queueing is not enabled")
+		return fmt.Errorf("torrent queueing is not enabled")
 	default:
-		return wrapper.Errorf("An unknown error occurred causing a status code of: %v", sc)
+		return fmt.Errorf("an unknown error occurred causing a status code of: %v", sc)
 	}
 }
 
 // DecreasePriority of torrents
 func (client *Client) DecreasePriority(hashes []string) error {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
+	opts := map[string]string{"hashes": strings.Join(hashes, "|")}
 	resp, err := client.post("api/v2/torrents/decreasePrio", opts)
 	if err != nil {
 		return err
 	}
 
-	switch sc := (*resp).StatusCode; sc {
+	_ = resp.Body.Close()
+	switch sc := resp.StatusCode; sc {
 	case 200:
 		return nil
 	case 409:
-		return wrapper.Errorf("Torrent queueing is not enabled")
+		return fmt.Errorf("torrent queueing is not enabled")
 	default:
-		return wrapper.Errorf("An unknown error occurred causing a status code of: %v", sc)
+		return fmt.Errorf("an unknown error occurred causing a status code of: %v", sc)
 	}
 }
 
 // MaxPriority maximizes the priority of torrents
 func (client *Client) MaxPriority(hashes []string) error {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
+	opts := map[string]string{"hashes": strings.Join(hashes, "|")}
 	resp, err := client.post("api/v2/torrents/topPrio", opts)
 	if err != nil {
 		return err
 	}
 
-	switch sc := (*resp).StatusCode; sc {
+	_ = resp.Body.Close()
+	switch sc := resp.StatusCode; sc {
 	case 200:
 		return nil
 	case 409:
-		return wrapper.Errorf("Torrent queueing is not enabled")
+		return fmt.Errorf("torrent queueing is not enabled")
 	default:
-		return wrapper.Errorf("An unknown error occurred causing a status code of: %v", sc)
+		return fmt.Errorf("an unknown error occurred causing a status code of: %v", sc)
 	}
 }
 
 // MinPriority maximizes the priority of torrents
 func (client *Client) MinPriority(hashes []string) error {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
+	opts := map[string]string{"hashes": strings.Join(hashes, "|")}
 	resp, err := client.post("api/v2/torrents/bottomPrio", opts)
 	if err != nil {
 		return err
 	}
 
-	switch sc := (*resp).StatusCode; sc {
+	_ = resp.Body.Close()
+	switch sc := resp.StatusCode; sc {
 	case 200:
 		return nil
 	case 409:
-		return wrapper.Errorf("Torrent queueing is not enabled")
+		return fmt.Errorf("torrent queueing is not enabled")
 	default:
-		return wrapper.Errorf("An unknown error occurred causing a status code of: %v", sc)
+		return fmt.Errorf("an unknown error occurred causing a status code of: %v", sc)
 	}
 }
 
 // FilePriority for a torrent
 func (client *Client) FilePriority(hash string, ids []int, priority int) error {
-	formattedIds := []string{}
-	for _, id := range ids {
-		formattedIds = append(formattedIds, strconv.Itoa(id))
+	formattedIds := make([]string, len(ids))
+	for i, id := range ids {
+		formattedIds[i] = strconv.Itoa(id)
 	}
 
 	opts := map[string]string{
 		"hash":     hash,
-		"id":       delimit(formattedIds, "|"),
+		"id":       strings.Join(formattedIds, "|"),
 		"priority": strconv.Itoa(priority),
 	}
 	resp, err := client.post("api/v2/torrents/filePrio", opts)
@@ -850,47 +809,44 @@ func (client *Client) FilePriority(hash string, ids []int, priority int) error {
 		return err
 	}
 
-	switch sc := (*resp).StatusCode; sc {
+	_ = resp.Body.Close()
+	switch sc := resp.StatusCode; sc {
 	case 200:
 		return nil
 	case 400:
-		return wrapper.Errorf("Priority is invalid or at least one id is not an integer")
+		return fmt.Errorf("priority is invalid or at least one id is not an integer")
 	case 409:
-		return wrapper.Errorf("Torrent metadata hasn't downloaded yet or at least one file id was not found")
+		return fmt.Errorf("torrent metadata hasn't downloaded yet or at least one file id was not found")
 	default:
-		return wrapper.Errorf("An unknown error occurred causing a status code of: %v", sc)
+		return fmt.Errorf("an unknown error occurred causing a status code of: %v", sc)
 	}
 }
 
 // GetTorrentDownloadLimit for a list of torrents
 func (client *Client) GetTorrentDownloadLimit(hashes []string) (limits map[string]int, err error) {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
-	resp, err := client.post("api/v2/torrents/downloadLimit", opts)
-	if err != nil {
-		return limits, err
-	}
-	json.NewDecoder(resp.Body).Decode(&limits)
-	return limits, nil
+	err = client.postJSON("api/v2/torrents/downloadLimit", map[string]string{"hashes": strings.Join(hashes, "|")},
+		&limits)
+	return
 }
 
 // SetTorrentDownloadLimit for a list of torrents
 func (client *Client) SetTorrentDownloadLimit(hashes []string, limit int) (bool, error) {
 	opts := map[string]string{
-		"hashes": delimit(hashes, "|"),
+		"hashes": strings.Join(hashes, "|"),
 		"limit":  strconv.Itoa(limit),
 	}
 	resp, err := client.post("api/v2/torrents/setDownloadLimit", opts)
 	if err != nil {
 		return false, err
 	}
-
+	_ = resp.Body.Close()
 	return resp.StatusCode == 200, nil
 }
 
 // SetTorrentShareLimit for a list of torrents
 func (client *Client) SetTorrentShareLimit(hashes []string, ratioLimit int, seedingTimeLimit int) (bool, error) {
 	opts := map[string]string{
-		"hashes":           delimit(hashes, "|"),
+		"hashes":           strings.Join(hashes, "|"),
 		"ratioLimit":       strconv.Itoa(ratioLimit),
 		"seedingTimeLimit": strconv.Itoa(seedingTimeLimit),
 	}
@@ -898,31 +854,28 @@ func (client *Client) SetTorrentShareLimit(hashes []string, ratioLimit int, seed
 	if err != nil {
 		return false, err
 	}
-
+	_ = resp.Body.Close()
 	return resp.StatusCode == 200, nil
 }
 
 // GetTorrentUploadLimit for a list of torrents
 func (client *Client) GetTorrentUploadLimit(hashes []string) (limits map[string]int, err error) {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
-	resp, err := client.post("api/v2/torrents/uploadLimit", opts)
-	if err != nil {
-		return limits, err
-	}
-	json.NewDecoder(resp.Body).Decode(&limits)
-	return limits, nil
+	err = client.postJSON("api/v2/torrents/uploadLimit", map[string]string{"hashes": strings.Join(hashes, "|")},
+		&limits)
+	return
 }
 
 // SetTorrentUploadLimit for a list of torrents
 func (client *Client) SetTorrentUploadLimit(hashes []string, limit int) (bool, error) {
 	opts := map[string]string{
-		"hashes": delimit(hashes, "|"),
+		"hashes": strings.Join(hashes, "|"),
 		"limit":  strconv.Itoa(limit),
 	}
 	resp, err := client.post("api/v2/torrents/setUploadLimit", opts)
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
 
 	return resp.StatusCode == 200, nil
 }
@@ -930,13 +883,14 @@ func (client *Client) SetTorrentUploadLimit(hashes []string, limit int) (bool, e
 // SetTorrentLocation for a list of torrents
 func (client *Client) SetTorrentLocation(hashes []string, location string) (bool, error) {
 	opts := map[string]string{
-		"hashes":   delimit(hashes, "|"),
+		"hashes":   strings.Join(hashes, "|"),
 		"location": location,
 	}
 	resp, err := client.post("api/v2/torrents/setLocation", opts)
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
 
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
@@ -951,6 +905,7 @@ func (client *Client) SetTorrentName(hash string, name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
 
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
@@ -958,25 +913,22 @@ func (client *Client) SetTorrentName(hash string, name string) (bool, error) {
 // SetTorrentCategory for a list of torrents
 func (client *Client) SetTorrentCategory(hashes []string, category string) (bool, error) {
 	opts := map[string]string{
-		"hashes":   delimit(hashes, "|"),
+		"hashes":   strings.Join(hashes, "|"),
 		"category": category,
 	}
 	resp, err := client.post("api/v2/torrents/setCategory", opts)
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
 
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
 
 // GetCategories used by client
 func (client *Client) GetCategories() (categories Categories, err error) {
-	resp, err := client.get("api/v2/torrents/categories", nil)
-	if err != nil {
-		return categories, err
-	}
-	json.NewDecoder(resp.Body).Decode(&categories)
-	return categories, nil
+	err = client.getJSON("api/v2/torrents/categories", nil, &categories)
+	return
 }
 
 // CreateCategory for use by client
@@ -989,6 +941,7 @@ func (client *Client) CreateCategory(category string, savePath string) (bool, er
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
 
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
@@ -1003,17 +956,19 @@ func (client *Client) UpdateCategory(category string, savePath string) (bool, er
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
 
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
 
 // DeleteCategories used by client
 func (client *Client) DeleteCategories(categories []string) (bool, error) {
-	opts := map[string]string{"categories": delimit(categories, "\n")}
+	opts := map[string]string{"categories": strings.Join(categories, "\n")}
 	resp, err := client.post("api/v2/torrents/removeCategories", opts)
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
 
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
@@ -1021,13 +976,14 @@ func (client *Client) DeleteCategories(categories []string) (bool, error) {
 // AddTorrentTags to a list of torrents
 func (client *Client) AddTorrentTags(hashes []string, tags []string) (bool, error) {
 	opts := map[string]string{
-		"hashes": delimit(hashes, "|"),
-		"tags":   delimit(tags, ","),
+		"hashes": strings.Join(hashes, "|"),
+		"tags":   strings.Join(tags, ","),
 	}
 	resp, err := client.post("api/v2/torrents/addTags", opts)
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
 
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
@@ -1035,45 +991,44 @@ func (client *Client) AddTorrentTags(hashes []string, tags []string) (bool, erro
 // RemoveTorrentTags from a list of torrents (empty list removes all tags)
 func (client *Client) RemoveTorrentTags(hashes []string, tags []string) (bool, error) {
 	opts := map[string]string{
-		"hashes": delimit(hashes, "|"),
-		"tags":   delimit(tags, ","),
+		"hashes": strings.Join(hashes, "|"),
+		"tags":   strings.Join(tags, ","),
 	}
 	resp, err := client.post("api/v2/torrents/removeTags", opts)
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
 
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
 
 // GetTorrentTags from a list of torrents (empty list removes all tags)
 func (client *Client) GetTorrentTags() (tags []string, err error) {
-	resp, err := client.get("api/v2/torrents/tags", nil)
-	if err != nil {
-		return nil, err
-	}
-	json.NewDecoder(resp.Body).Decode(&tags)
-	return tags, nil
+	err = client.getJSON("api/v2/torrents/tags", nil, &tags)
+	return
 }
 
 // CreateTags for use by client
 func (client *Client) CreateTags(tags []string) (bool, error) {
-	opts := map[string]string{"tags": delimit(tags, ",")}
+	opts := map[string]string{"tags": strings.Join(tags, ",")}
 	resp, err := client.post("api/v2/torrents/createTags", opts)
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
 
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
 
 // DeleteTags used by client
 func (client *Client) DeleteTags(tags []string) (bool, error) {
-	opts := map[string]string{"tags": delimit(tags, ",")}
+	opts := map[string]string{"tags": strings.Join(tags, ",")}
 	resp, err := client.post("api/v2/torrents/deleteTags", opts)
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
 
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
@@ -1081,58 +1036,62 @@ func (client *Client) DeleteTags(tags []string) (bool, error) {
 // SetAutoManagement for a list of torrents
 func (client *Client) SetAutoManagement(hashes []string, enable bool) (bool, error) {
 	opts := map[string]string{
-		"hashes": delimit(hashes, "|"),
+		"hashes": strings.Join(hashes, "|"),
 		"enable": strconv.FormatBool(enable),
 	}
 	resp, err := client.post("api/v2/torrents/setAutoManagement", opts)
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
+
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
 
 // ToggleSequentialDownload for a list of torrents
 func (client *Client) ToggleSequentialDownload(hashes []string) (bool, error) {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
+	opts := map[string]string{"hashes": strings.Join(hashes, "|")}
 	resp, err := client.get("api/v2/torrents/toggleSequentialDownload", opts)
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
+
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
 
 // ToggleFirstLastPiecePriority for a list of torrents
-func (client *Client) ToggleFirstLastPiecePriority(hashes []string) (bool, error) {
-	opts := map[string]string{"hashes": delimit(hashes, "|")}
-	resp, err := client.get("api/v2/torrents/toggleFirstLastPiecePrio", opts)
-	if err != nil {
-		return false, err
-	}
-	return resp.StatusCode == 200, nil //TODO: look into other statuses
+func (client *Client) ToggleFirstLastPiecePriority(hashes []string) error {
+	return client.getStatus("api/v2/torrents/toggleFirstLastPiecePrio",
+		map[string]string{"hashes": strings.Join(hashes, "|")})
 }
 
 // SetForceStart for a list of torrents
 func (client *Client) SetForceStart(hashes []string, value bool) (bool, error) {
 	opts := map[string]string{
-		"hashes": delimit(hashes, "|"),
+		"hashes": strings.Join(hashes, "|"),
 		"value":  strconv.FormatBool(value),
 	}
 	resp, err := client.post("api/v2/torrents/setForceStart", opts)
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
+
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
 
 // SetSuperSeeding for a list of torrents
 func (client *Client) SetSuperSeeding(hashes []string, value bool) (bool, error) {
 	opts := map[string]string{
-		"hashes": delimit(hashes, "|"),
+		"hashes": strings.Join(hashes, "|"),
 		"value":  strconv.FormatBool(value),
 	}
 	resp, err := client.post("api/v2/torrents/setSuperSeeding", opts)
 	if err != nil {
 		return false, err
 	}
+	_ = resp.Body.Close()
+
 	return resp.StatusCode == 200, nil //TODO: look into other statuses
 }
